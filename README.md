@@ -1,6 +1,8 @@
 # Multi-Platform Content Scraper (YouTube + TikTok)
 
-A production-ready Streamlit tool to search YouTube and TikTok, apply keyword filters, collect comments with target-based quotas, and save everything to Google Sheets. Built for scalable data collection (10,000+ comments per day) with intelligent quota management and incremental saving.
+A reusable Streamlit-based scraper for collecting YouTube and TikTok video metadata, channel/creator metadata, transcripts, and comments for portfolio analytics projects. The tool is designed for topic-based research: change the search keywords, run a new scrape, and store normalized results in a shared PostgreSQL database such as Neon.
+
+> Current production path: YouTube scraping on Streamlit Cloud + Neon PostgreSQL. TikTok is kept in the app design, but browser-based scraping is best run locally or in a backend environment that supports Firefox/geckodriver.
 
 ---
 
@@ -8,355 +10,205 @@ A production-ready Streamlit tool to search YouTube and TikTok, apply keyword fi
 
 | Feature | Detail |
 |---|---|
-| **Dual-platform support** | Toggle between YouTube and TikTok in the same interface |
-| **Target-based comment collection** | Set a specific target (e.g., 5,000 comments) — scraper stops automatically when reached |
-| **Incremental comment saving** | Comments saved every 100 rows during collection (no memory limits, no data loss) |
-| **4 AND-logic keyword filters** | Title/Description · Channel/Author · Transcript (YouTube only) · Comments |
-| **Video popularity filters** | Date range · Minimum views · Minimum comment count on video |
-| **YouTube API quota dashboard** | Real-time tracking of daily 10,000 unit limit with visual warnings |
-| **TikTok free scraping** | Uses browser automation (pyktok) — no API key or quota limits |
-| **Optional transcript save** | One row per video in the `transcripts` sheet (YouTube only, FREE) |
-| **Optional comment limit per video** | Toggle on/off — prevent bias from viral videos or fetch all comments |
-| **Skip recently scraped videos** | Avoid re-processing videos from the last 7 days |
-| **Duplicate detection** | Rows already in a sheet (matched by ID) are skipped automatically |
-| **Channel/creator info sheet** | Subscribers, video count, total views, bio, and more |
-| **Run log sheet** | Timestamp, user, platform, keywords, counts saved, quota used |
-| **Preview before saving** | Inspect all result sets before committing to Sheets |
-| **Retry logic with backoff** | Automatically retries failed API calls (handles rate limits gracefully) |
+| **Reusable topic workflow** | Run different research topics by changing title, channel/author, transcript, and comment keywords. |
+| **YouTube API integration** | Uses YouTube Data API v3 for search, video metadata, comments, and channel metadata. |
+| **PostgreSQL data layer** | Stores videos, comments, channels, transcripts, projects, and run logs in Neon/PostgreSQL. |
+| **Target-based comment collection** | Set a target number of comments; scraper stops when the target is reached or matching videos are exhausted. |
+| **Incremental saving** | Saves comment batches during scraping to reduce data-loss risk. |
+| **Duplicate prevention** | Uses stable IDs and database constraints to avoid re-saving the same videos/comments. |
+| **Keyword filters** | Supports AND-style filters for title/description, channel/author, transcript, and comments. |
+| **Date and popularity filters** | Filter by publish date range, minimum views, and minimum video comments. |
+| **Quota tracking** | Displays YouTube API quota usage estimates during the session. |
+| **Preview tables** | Shows videos, channels, and sample comments before final metadata save. |
+| **Portfolio-ready logging** | Captures run metadata such as platform, keywords, user, quota usage, and result counts. |
 
 ---
 
-## Google Spreadsheet Sheet Structure
+## Data Layer
 
-Create a new Google Spreadsheet and add these **5 sheets** (tabs) — names are case-sensitive:
+This project now uses PostgreSQL instead of Google Sheets as the primary storage layer. Neon is recommended because it is easy to share with collaborators and works well with Streamlit Cloud.
 
-| Sheet name | Purpose |
+Recommended core tables:
+
+| Table | Purpose |
 |---|---|
-| `videos` | One row per scraped video (includes platform column) |
-| `transcripts` | One row per video with full transcript (YouTube only) |
-| `comments` | One row per comment (includes platform column) |
-| `channels` | One row per unique channel/creator (includes platform column) |
-| `run_log` | One row per scrape run |
+| `projects` | One row per analysis project or topic. |
+| `scrape_runs` | One row per scraper execution. |
+| `channels` | One row per YouTube channel or TikTok creator. |
+| `videos` | One row per video. |
+| `transcripts` | One row per video transcript, when available. |
+| `comments` | One row per comment. |
+| `project_videos` | Many-to-many bridge between projects and videos. |
+| `project_comments` | Many-to-many bridge between projects and comments. |
 
-The tool will create headers automatically on first save — just leave the sheets empty.
+This structure allows one raw video/comment to be reused across multiple projects without duplication.
+
+---
+
+## Repository Structure
+
+```text
+content-scraper/
+├── app.py                         # Main Streamlit app
+├── requirements.txt               # Streamlit Cloud dependencies
+├── README.md                      # Project documentation
+├── LICENSE                        # MIT license
+├── secrets.toml.example           # Example Streamlit secrets file
+└── sql/
+    └── neon_social_scraper_schema.sql   # Optional database schema setup
+```
 
 ---
 
 ## Setup
 
-### 1 — Clone / copy the project
+### 1. Clone the project
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/content-scraper.git
-cd content-scraper
+git clone https://github.com/YOUR_USERNAME/portfolio-youtube-tiktok-scraper.git
+cd portfolio-youtube-tiktok-scraper
 pip install -r requirements.txt
 ```
 
-### 2 — YouTube Data API v3 key
+### 2. Create a Neon PostgreSQL database
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/).
-2. Create a project (or use an existing one).
-3. Enable **YouTube Data API v3** under *APIs & Services → Library*.
-4. Under *APIs & Services → Credentials*, click **Create Credentials → API key**.
-5. Copy the key.
+1. Create a Neon project.
+2. Create or use the default database, for example `neondb`.
+3. Copy the pooled connection string.
+4. Add the connection string to Streamlit secrets as `DATABASE_URL`.
 
-> **Quota note:**
-> The free tier gives 10,000 units/day.
-> A typical scrape run of 50 videos uses roughly 300–500 units.
-> Transcript fetching uses `youtube-transcript-api` (no quota cost).
-> Comment fetching costs ~1 unit per page of 100 comments.
+Example:
 
-> **YouTube Quota Breakdown Simulation (for 5,000 comments):**
-> Search: 100 units (one-time)
-> Video metadata: ~1 unit per 50 videos
-> Comments: 1 unit per 100 comments (≈50 units for 5,000 comments)
-> Channels: 1 unit per unique channel
-> **Total: ~150-200 units for 5,000 comments** — well within the 10,000 daily limit.
-
-### 3 — Google Sheets service account
-
-1. In the same GCP project, go to *IAM & Admin → Service Accounts*.
-2. Create a new service account, give it no special roles.
-3. Create a JSON key for it and download it.
-4. **Share your Google Spreadsheet** with the service-account email address (Editor role).
-
-### 4 — Streamlit secrets
-
-1. Create the .streamlit directory and secrets.toml file:
-```bash
-mkdir -p .streamlit
-touch .streamlit/secrets.toml
-```
-
-2. Edit .streamlit/secrets.toml and add the following:
 ```toml
-# .streamlit/secrets.toml
-YOUTUBE_API_KEY = "AIzaSyYourActualYouTubeAPIKeyHere"
-
-[connections.gsheets]
-type = "service_account"
-project_id = "your-project-id"
-private_key_id = "abc123def456..."
-private_key = "-----BEGIN PRIVATE KEY-----\nMIIEv...\n-----END PRIVATE KEY-----\n"
-client_email = "your-service-account@your-project.iam.gserviceaccount.com"
-client_id = "123456789012345678901"
-auth_uri = "https://accounts.google.com/o/oauth2/auth"
-token_uri = "https://oauth2.googleapis.com/token"
-spreadsheet = "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit"
+YOUTUBE_API_KEY = "YOUR_YOUTUBE_DATA_API_V3_KEY"
+DATABASE_URL = "postgresql+psycopg2://USER:PASSWORD@HOST/DATABASE?sslmode=require"
 ```
 
-**⚠️Never commit `secrets.toml`** — it is listed in `.gitignore`.
+Do not commit `.streamlit/secrets.toml` to GitHub.
 
-### 5 — TikTok Dependencies (Optional)
+### 3. Create the database schema
 
-TikTok scraping requires additional setup:
-1. Install Firefox (recommended) or Chrome:
-> macOS: `brew install firefox`
-> Ubuntu: `sudo apt install firefox`
-> Windows: Download from Mozilla (https://www.mozilla.org/firefox/)
-2. Install geckodriver (for Firefox automation):
->  macOS: `brew install geckodriver`
-> Ubuntu: `sudo apt install firefox-geckodriver`
-> Windows: Download from GitHub releases (https://github.com/mozilla/geckodriver/releases)
-
-**💡 Note:** TikTok scraping uses browser automation and may open a window during first run. This is normal.
-
-### 6 — Run
+Run the PostgreSQL schema file in Neon SQL Editor or through a local SQL client:
 
 ```bash
-streamlit run app.py
+psql "$DATABASE_URL" -f sql/neon_social_scraper_schema.sql
 ```
+
+### 4. Create a YouTube Data API key
+
+1. Open Google Cloud Console.
+2. Enable **YouTube Data API v3**.
+3. Create an API key.
+4. Add the key to Streamlit secrets as `YOUTUBE_API_KEY`.
+
+---
+
+## Streamlit Cloud Deployment
+
+Use this `requirements.txt` for Streamlit Cloud:
+
+```txt
+streamlit>=1.35.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+google-api-python-client>=2.130.0
+youtube-transcript-api>=0.6.2
+pandas>=2.0.0
+tenacity>=8.2.0
+```
+
+Do not include `streamlit-gsheets-connection` in the deployed requirements. The app now uses PostgreSQL.
 
 ---
 
 ## Usage
 
-1. Select platform (YouTube or TikTok) in the sidebar
-2. Enter your name (recorded in run log)
-3. Fill keyword filters (all active filters must match — AND logic)
-4. Set popularity filters (optional): date range, minimum views, minimum comments
-5. Set target comments (e.g., 5,000) — scraper stops automatically
-6. Configure collection settings:
-> Search pool size (how many videos to scan)
-> Enable/disable comment limit per video
-> Skip recently scraped videos (7 days)
-7. Click ▶ Run Scrape
-8. Review preview tables
-9. Click 💾 SAVE REMAINING DATA to save videos, channels, and transcripts
+1. Open the Streamlit app.
+2. Select the platform.
+3. Enter your name for run logging.
+4. Add keyword filters.
+5. Optionally enable publish-date filtering.
+6. Set minimum views or minimum video comments.
+7. Set target comments and scan pool size.
+8. Run the scrape.
+9. Review preview tables.
+10. Save final metadata to PostgreSQL.
 
-**💡 Comments are saved automatically during scraping** — no second save step needed!
+Comments are saved incrementally during collection. Final save stores videos, channels, transcripts, and the run log.
 
 ---
 
-## Platform Comparison
+## Suggested Research Workflow
 
-| Aspect | YouTube | TikTok
-|---|---|---|
-| API Cost | Quota-based (10k units/day free) | Free (browser automation)
-| Speed | Fast (~1-2 sec/video) | Slower (~5-10 sec/video)
-| Transcripts | Available (auto-generated) | Not available
-| Comment depth | Top-level only | Top-level only
-| Rate limiting | Official API limits | Browser-dependent
-| Best for | Structured analysis, transcripts | Emerging trends, free scraping
+For each portfolio topic:
 
----
-
-## Filter behaviour
-
-1. YouTube
-| Filter | What it checks | Cost | Speed
-|---|---|---|---|
-| Title/Description | Video title + description | Free (metadata) | Fast
-| Channel name | Channel display name | Free (metadata) | Fast
-| Transcript | Full auto-transcript text | Free (no API cost) | Slow (1-2 sec/video)
-| Comments | Any top-level comment text | ~1 unit per 100 comments | Medium
-| Date range | Published date | Free (metadata) | Fast
-| Min views | View count | Free (metadata) | Fast
-
-2. TikTok
-| Filter | What it checks | Cost | Speed
-|---|---|---|---|
-| Title/Description | Video description text | Free | Medium
-| Author name | Creator username | Free | Medium
-| Comments | Any comment text | Free | Slow
-| Date range | Published date | Free | Medium
-
-**Important notes:**
-> When multiple filters are set, **all** must match for a video to be included.
-> YouTube transcript filter **only applies to videos WITH transcripts** (videos without transcript are skipped).
-> TikTok does not support transcript search.
+1. Create a project label, such as `Vietnam QSR Market Entry`.
+2. Run several keyword groups, such as:
+   - `Vietnam street food`
+   - `McDonald's Vietnam`
+   - `KFC Vietnam`
+   - `foreign fast food Vietnam`
+   - `Vietnam food delivery`
+3. Collect broad raw data first.
+4. Clean, standardize, translate, and classify comments later.
+5. Analyze themes such as price sensitivity, taste expectations, localization, brand trust, service quality, and convenience.
 
 ---
 
-## Screenshots
+## YouTube Quota Notes
 
-1. Platform Selector & Quota Dashboard
-┌─────────────────────────────────────────────┐
-│ 🔍 Platform & Search                        │
-│ ○ YouTube  ● TikTok                         │
-│                                             │
-│ ┌─────────────────────────────────────────┐ │
-│ │ 📊 YouTube API Quota Remaining          │ │
-│ │                                         │ │
-│ │     9,850 / 10,000                      │ │
-│ │     ████████░░ 98%                      │ │
-│ │                                         │ │
-│ │ TikTok has no quota limits 🎵           │ │
-│ └─────────────────────────────────────────┘ │
-└─────────────────────────────────────────────┘
+Approximate quota costs:
 
-2. Popularity Filters
-┌─────────────────────────────────────────────┐
-│ 🎯 Video Popularity Filters                 │
-│                                             │
-│ Published after    [2024-01-01]            │
-│ Published before   [2024-12-31]            │
-│ Minimum views      [1000    ] (+)          │
-│ Minimum comments   [100     ] (+)          │
-└─────────────────────────────────────────────┘
+| Operation | Approximate cost |
+|---|---:|
+| Search request | 100 units |
+| Video metadata batch | 1 unit per up to 50 videos |
+| Comment page | 1 unit per up to 100 comments |
+| Channel metadata | 1 unit per channel |
 
-3. Collection Settings
-┌─────────────────────────────────────────────┐
-│ ⚙️ Collection Settings                      │
-│                                             │
-│ 🎯 Target comments:  [5000    ] (+)        │
-│ 🔍 Search pool size: [200     ] (+)        │
-│                                             │
-│ ☑️ Limit comments per video                 │
-│    Max per video:    [500     ] (+)        │
-│                                             │
-│ ☑️ Skip videos scraped in last 7 days      │
-└─────────────────────────────────────────────┘
+A 1,500-comment test run may use roughly 50-100 units depending on the number of videos and channels processed.
 
 ---
 
-## ## Support and Troubleshooting
+## TikTok Notes
 
-For issues:
-1. Check the Troubleshooting section.
-2. Verify your API key and sheet permissions.
-3. Ensure all 5 sheets exist in your Google Spreadsheet.
-4. For TikTok, confirm Firefox and geckodriver are installed.
+TikTok scraping is browser-automation based and may not run reliably on Streamlit Cloud. Keep TikTok integrated in the interface for a unified workflow, but run TikTok collection locally or on a backend that supports browser automation.
 
-Troubleshooting:
+Suggested optional local requirements:
 
-1. YouTube Issues
-| Problem | Solution
-|---|---|
-| Quota exceeded | Check sidebar for usage (resets daily at UTC midnight). Reduce target or wait until tomorrow.
-| No transcripts found | Not all videos have transcripts. Try increasing search pool size.
-| Comments not saving | Verify `comments` sheet exists and service account has Editor access.
-| "quotaExceeded" during comments | Comments cost 1 unit/100. 10,000 comments = 100 units (should be fine). Check other API usage.
-
-2. TikTok Issues
-| Problem | Solution
-|---|---|
-| pyktok not found | Run `pip install pyktok selenium`.
-| Browser not launching | Install Firefox and geckodriver (see Setup section).
-| No videos found | TikTok search may be rate-limited. Try different keywords or wait a few minutes.
-| Comments not scraping | TikTok may require login. Some videos have comments disabled.
-| Slow performance | TikTok uses browser automation — 5-10 seconds per video is normal.
-
-3. General Issues
-| Problem | Solution
-|---|---|
-| "Your name is required" | Enter any identifier in the sidebar (e.g., "John" or "project_alpha")
-| No videos matched filters | Try removing filters one by one to identify the blocker
-| Sheet connection error | Verify `secrets.toml` has correct spreadsheet URL and service account has access
-| Duplicate comments not skipped | Tool uses `comment_id` for deduplication — existing comments won't be re-saved
-
----
-
-## Performance Benchmarks
-
-1. YouTube (with API)
-| Target comments | Videos processed | API calls | Time (est.) | Quota used
-|---|---|---|---|---|
-| 1,000 | 20-30 | 10-15 | 2-3 min | ~40 units
-| 5,000 | 100-150 | 50-75 | 10-15 min | ~150 units
-| 10,000 | 200-300 | 100-150 | 20-30 min | ~250 units
-| 50,000 | 1,000+ | 500+ | 2-3 hours | ~1,000 units
-
-2. TikTok (browser automation)
-| Target comments | Videos processed | Time (est.) | Quota used
-|---|---|---|---|
-| 500 | 10-20 | 5-10 min | Browser launches per video
-| 1,000 | 20-40 | 15-20 min | Can be parallelized
-| 5,000 | 100-200 | 1-2 hours | Best for overnight runs
-
-**Note:** All YouTube benchmarks within free daily quota (10,000 units/day).
-
----
-
-## Project Structure
-
-```text
-content-scraper/
-├── app.py                    # Main application (YouTube + TikTok)
-├── README.md                 # This file
-├── requirements.txt          # Python dependencies
-├── .gitignore               # Git ignore rules
-└── .streamlit/
-    └── secrets.toml         # API keys (NOT committed)
+```txt
+pyktok>=0.2.0
+selenium>=4.15.0
 ```
 
 ---
 
-## Portfolio Case Study Notes
+## Troubleshooting
 
-This project demonstrates:
-| Competency | Evidence
-|---|---|
-| API integration | YouTube Data API v3 with quota management
-| Rate limit handling | Retry logic with exponential backoff
-| Scalable data collection | Target-based collection, incremental saving
-| Platform trade-offs | YouTube (structured, quota) vs TikTok (free, slower)
-| Data deduplication | Comment ID tracking across sessions
-| User experience | Preview before save, progress bars, real-time status
-| Production considerations | Secrets management, error handling, logging
+| Problem | Likely cause | Fix |
+|---|---|---|
+| Dependency install fails | Old Google Sheets package still in requirements | Remove `streamlit-gsheets-connection`. |
+| Database connection fails | Invalid `DATABASE_URL` or expired Neon password | Re-copy the pooled Neon connection string and confirm `sslmode=require`. |
+| No videos matched filters | Filters are too narrow | Remove filters one by one and increase scan pool size. |
+| Few comments collected | Matching videos have limited comments | Increase scan pool size or broaden keywords. |
+| TikTok fails on Streamlit Cloud | Browser automation unavailable | Run TikTok locally or on a backend server. |
 
 ---
 
-## Roadmap / Future Enhancements
+## Portfolio Case Study Value
 
-> **Instagram Reels** support (Graph API or browser automation)
-> **Facebook public page comments** (Graph API, requires app review)
-> **Comment replies** (nested comments for YouTube and TikTok)
-> **Sentiment analysis** integration
-> **Export to CSV/JSON** option (in addition to Google Sheets)
-> **Parallel processing** for faster TikTok scraping
-> **Docker container** for easy deployment
+This project demonstrates:
+
+| Competency | Evidence |
+|---|---|
+| API integration | YouTube Data API v3 usage with quota awareness. |
+| Data engineering | PostgreSQL schema, deduplication, incremental inserts. |
+| Research tooling | Reusable scraper for multiple business topics. |
+| Product thinking | Streamlit UI with filters, previews, and run tracking. |
+| Analytics readiness | Normalized tables for later cleaning, NLP, and dashboarding. |
 
 ---
 
 ## License
 
-MIT — free for academic and portfolio use.
-
----
-
-## Version History
-
-| Version | Date | Changes
-|---|---|---|
-| v1.0 | 2026-06-02 | YouTube-TikTok multi-platform release with keyword filters and batch saving, popularity filters, deduplication.
-
----
-
-## Acknowledgements
-
-> YouTube Data API v3 (https://developers.google.com/youtube/v3)
-> youtube-transcript-api (https://github.com/jdepoix/youtube-transcript-api)
-> pyktok for TikTok scraping (https://github.com/dfreelon/pyktok)
-> Streamlit for the UI framework (https://streamlit.io/)
-
----
-
-## .gitignore
-
-```
-.streamlit/secrets.toml
-__pycache__/
-*.pyc
-.env
-```
+MIT License. See `LICENSE`.
