@@ -7,7 +7,7 @@ Integrated platform scraper supporting:
 
 Features:
 - Target-based comment collection
-- Incremental saving to Google Sheets
+- Incremental saving to database
 - Video popularity filters (views, date, comment count)
 - Optional comment limit per video
 - Duplicate detection and skipping
@@ -22,9 +22,10 @@ from typing import Dict, List, Optional, Tuple, Callable
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import Engine
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from streamlit_gsheets import GSheetsConnection
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -93,81 +94,144 @@ def check_quota_and_warn(additional_cost: int = 0) -> bool:
     return True
 
 
-def read_sheet_safe(conn, worksheet: str) -> pd.DataFrame:
-    """Safely read a worksheet, returning empty DataFrame on error."""
+def get_db_engine() -> Engine:
+    """Create the shared data connection.
+
+    Recommended for collaboration: set DATABASE_URL in Streamlit secrets to a hosted
+    PostgreSQL URL, for example:
+    postgresql+psycopg2://USER:PASSWORD@HOST:5432/DBNAME
+
+    Local fallback: SQLite. This is useful for testing, but not ideal on Streamlit
+    Cloud because the file is not a durable shared database.
+    """
+    database_url = st.secrets.get("DATABASE_URL", "sqlite:///scraper_local.db")
+    return create_engine(database_url, pool_pre_ping=True)
+
+
+def _table_exists(engine: Engine, table_name: str) -> bool:
+    return inspect(engine).has_table(table_name)
+
+
+def _quote_identifier(name: str) -> str:
+    # The table/column names in this app are controlled constants, but quote anyway.
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _add_missing_columns(engine: Engine, table_name: str, df: pd.DataFrame) -> None:
+    """Allow the schema to evolve when new columns are added to the app."""
+    if not _table_exists(engine, table_name):
+        return
+
+    existing_cols = {col["name"] for col in inspect(engine).get_columns(table_name)}
+    missing_cols = [c for c in df.columns if c not in existing_cols]
+    if not missing_cols:
+        return
+
+    dialect = engine.dialect.name
+    with engine.begin() as conn:
+        for col in missing_cols:
+            if dialect == "postgresql":
+                conn.execute(text(f'ALTER TABLE {_quote_identifier(table_name)} ADD COLUMN {_quote_identifier(col)} TEXT'))
+            else:
+                conn.execute(text(f'ALTER TABLE {_quote_identifier(table_name)} ADD COLUMN {_quote_identifier(col)} TEXT'))
+
+
+def read_table_safe(engine: Engine, table_name: str) -> pd.DataFrame:
+    """Safely read a table, returning an empty DataFrame on error."""
     try:
-        df = conn.read(worksheet=worksheet, ttl=0)
-        return df if (df is not None and not df.empty) else pd.DataFrame()
-    except Exception:
+        if not _table_exists(engine, table_name):
+            return pd.DataFrame()
+        return pd.read_sql_table(table_name, engine)
+    except Exception as exc:
+        st.warning(f"Could not read table '{table_name}': {exc}")
         return pd.DataFrame()
 
 
 def append_unique_rows(
-    conn,
-    worksheet: str,
+    engine: Engine,
+    table_name: str,
     new_df: pd.DataFrame,
     key_col: str,
 ) -> Tuple[int, int]:
-    """Append rows whose key_col value is not already in the sheet."""
+    """Append rows whose key_col value is not already in the database table."""
     if new_df.empty:
         return 0, 0
 
-    existing = read_sheet_safe(conn, worksheet)
+    new_df = new_df.copy()
+    if key_col not in new_df.columns:
+        raise ValueError(f"Missing key column '{key_col}' in data for table '{table_name}'.")
 
-    if existing.empty:
-        conn.update(worksheet=worksheet, data=new_df)
+    # Store flexible scraped data safely as text/object values.
+    for col in new_df.columns:
+        new_df[col] = new_df[col].where(pd.notna(new_df[col]), None)
+
+    if not _table_exists(engine, table_name):
+        new_df.to_sql(table_name, engine, if_exists="replace", index=False)
+        with engine.begin() as conn:
+            try:
+                conn.execute(text(f'CREATE INDEX IF NOT EXISTS idx_{table_name}_{key_col} ON {_quote_identifier(table_name)} ({_quote_identifier(key_col)})'))
+            except Exception:
+                pass
         return len(new_df), 0
 
-    existing_keys = (
-        set(existing[key_col].astype(str).fillna("").tolist())
-        if key_col in existing.columns
-        else set()
-    )
+    _add_missing_columns(engine, table_name, new_df)
+
+    try:
+        existing_keys_df = pd.read_sql_query(
+            f'SELECT {_quote_identifier(key_col)} FROM {_quote_identifier(table_name)}',
+            engine,
+        )
+        existing_keys = set(existing_keys_df[key_col].astype(str).fillna("").tolist())
+    except Exception:
+        existing_keys = set()
+
     to_save = new_df[~new_df[key_col].astype(str).isin(existing_keys)].copy()
     duplicates_skipped = len(new_df) - len(to_save)
 
     if not to_save.empty:
-        updated = pd.concat([existing, to_save], ignore_index=True)
-        conn.update(worksheet=worksheet, data=updated)
+        to_save.to_sql(table_name, engine, if_exists="append", index=False)
 
     return len(to_save), duplicates_skipped
 
 
-def log_run(conn, payload: Dict) -> None:
-    """Log a scrape run to the run_log sheet."""
-    existing = read_sheet_safe(conn, LOG_SHEET)
-    updated = pd.concat([existing, pd.DataFrame([payload])], ignore_index=True)
-    conn.update(worksheet=LOG_SHEET, data=updated)
+def log_run(engine: Engine, payload: Dict) -> None:
+    """Log a scrape run to the run_log table."""
+    append_unique_rows(engine, LOG_SHEET, pd.DataFrame([payload]), key_col="run_id")
 
 
-def get_existing_comment_ids(conn) -> set:
+def get_existing_comment_ids(engine: Engine) -> set:
     """Get set of already-saved comment IDs for deduplication."""
     try:
-        existing_comments = read_sheet_safe(conn, COMMENTS_SHEET)
-        if not existing_comments.empty and "comment_id" in existing_comments.columns:
-            return set(existing_comments["comment_id"].astype(str).fillna("").tolist())
+        if not _table_exists(engine, COMMENTS_SHEET):
+            return set()
+        df = pd.read_sql_query(
+            f'SELECT comment_id FROM {_quote_identifier(COMMENTS_SHEET)}',
+            engine,
+        )
+        return set(df["comment_id"].astype(str).fillna("").tolist())
     except Exception:
-        pass
-    return set()
+        return set()
 
 
-def get_recently_scraped_video_ids(conn, days: int = 7) -> set:
+def get_recently_scraped_video_ids(engine: Engine, days: int = 7) -> set:
     """Get video IDs scraped in the last N days to avoid re-processing."""
     try:
-        existing_videos = read_sheet_safe(conn, VIDEOS_SHEET)
-        if existing_videos.empty or "video_id" not in existing_videos.columns:
+        if not _table_exists(engine, VIDEOS_SHEET):
             return set()
-        
-        # Filter by scraped_at date if column exists
-        if "scraped_at" in existing_videos.columns:
-            cutoff = datetime.now().timestamp() - (days * 86400)
-            recent = existing_videos[
-                pd.to_datetime(existing_videos["scraped_at"]).dt.timestamp() > cutoff
-            ]
-            return set(recent["video_id"].astype(str).fillna("").tolist())
+
+        df = pd.read_sql_query(
+            f'SELECT video_id, scraped_at FROM {_quote_identifier(VIDEOS_SHEET)}',
+            engine,
+        )
+        if df.empty or "scraped_at" not in df.columns:
+            return set()
+
+        cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
+        scraped_at = pd.to_datetime(df["scraped_at"], errors="coerce")
+        recent = df[scraped_at >= cutoff]
+        return set(recent["video_id"].astype(str).fillna("").tolist())
     except Exception:
-        pass
-    return set()
+        return set()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -284,6 +348,7 @@ def fetch_youtube_comments_incremental(
     video_id: str, 
     max_comments: int, 
     existing_ids: set,
+    comment_kw: str = "",
     save_callback: Optional[Callable] = None
 ) -> Tuple[List[Dict], int]:
     """
@@ -330,6 +395,10 @@ def fetch_youtube_comments_incremental(
                     "comment_likes": top.get("likeCount", 0),
                     "video_id": video_id,
                 }
+
+                if comment_kw.strip() and not all_keywords_present(comment_data["comment_text"], comment_kw):
+                    continue
+
                 comments.append(comment_data)
                 
                 # Incremental save callback
@@ -458,6 +527,7 @@ class TikTokScraper:
         video_id: str,
         max_comments: int,
         existing_ids: set,
+        comment_kw: str = "",
         save_callback: Optional[Callable] = None
     ) -> Tuple[List[Dict], int]:
         """Fetch TikTok comments, skipping existing IDs. Returns (comments, quota_used=0)."""
@@ -477,14 +547,19 @@ class TikTokScraper:
                     if comment_id in existing_ids:
                         continue
                         
-                    comments.append({
+                    comment_data = {
                         "comment_id": comment_id,
                         "comment_text": row.get('text', ''),
                         "author": row.get('author', ''),
                         "comment_likes": row.get('digg_count', 0),
                         "comment_published_at": row.get('create_time', '')[:10] if row.get('create_time') else '',
                         "video_id": video_id,
-                    })
+                    }
+
+                    if comment_kw.strip() and not all_keywords_present(comment_data["comment_text"], comment_kw):
+                        continue
+
+                    comments.append(comment_data)
                     
                     if save_callback and len(comments) % 100 == 0:
                         save_callback(comments[-100:])
@@ -634,7 +709,7 @@ st.markdown(
 )
 
 st.title("📺🎵 Content Scraper (YouTube + TikTok)")
-st.caption("Search → filter → preview → save unique rows to Google Sheets")
+st.caption("Search → filter → preview → save unique rows to database")
 
 # ── Quota display (YouTube only) ───────────────────────────────────────────────
 with st.sidebar:
@@ -647,7 +722,7 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-conn = st.connection("gsheets", type=GSheetsConnection)
+conn = get_db_engine()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -697,12 +772,26 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("🎯 Video Popularity Filters")
     
+    use_date_filter = st.checkbox(
+        "Filter by publish date",
+        value=False,
+        help="Turn this on when you need videos from a specific time period."
+    )
+
     col1, col2 = st.columns(2)
     with col1:
-        publish_date_start = st.date_input("Published after", value=None)
+        if use_date_filter:
+            publish_date_start = st.date_input("Published after", value=date(2024, 1, 1))
+        else:
+            publish_date_start = None
+            st.text_input("Published after", value="Not used", disabled=True)
         min_views = st.number_input("Minimum views", min_value=0, value=0, step=1000)
     with col2:
-        publish_date_end = st.date_input("Published before", value=None)
+        if use_date_filter:
+            publish_date_end = st.date_input("Published before", value=date.today())
+        else:
+            publish_date_end = None
+            st.text_input("Published before", value="Not used", disabled=True)
         min_comments_on_video = st.number_input("Minimum video comments", min_value=0, value=0, step=100)
     
     st.markdown("---")
@@ -712,16 +801,16 @@ with st.sidebar:
         "🎯 Target number of comments to collect",
         min_value=100,
         max_value=50000,
-        value=5000,
-        step=500,
+        value=20000,
+        step=1000,
         help="The scraper will collect comments until reaching this target."
     )
     
     scan_pool_size = st.number_input(
         "🔍 Search pool size (max videos to scan)",
         min_value=50,
-        max_value=500,
-        value=200,
+        max_value=1000,
+        value=1000,
         step=50,
         help="Number of videos to fetch metadata for before filtering."
     )
@@ -893,7 +982,7 @@ if run_search:
             comment_status.info(f"Fetching comments for: {video['title'][:50]}... (needs {remaining_needed} more)")
             
             video_comments, quota_used = fetch_youtube_comments_incremental(
-                yt, video["video_id"], to_fetch, existing_comment_ids, save_callback=save_youtube_comment_batch
+                yt, video["video_id"], to_fetch, existing_comment_ids, comment_kw=comment_kw, save_callback=save_youtube_comment_batch
             )
             
             total_quota_used += quota_used
@@ -997,7 +1086,7 @@ if run_search:
             comment_status.info(f"Fetching comments for TikTok video... (needs {remaining_needed} more)")
             
             video_comments, _ = tiktok.fetch_comments_incremental(
-                video["video_url"], video["video_id"], to_fetch, existing_comment_ids, save_callback=save_tiktok_comment_batch
+                video["video_url"], video["video_id"], to_fetch, existing_comment_ids, comment_kw=comment_kw, save_callback=save_tiktok_comment_batch
             )
             
             total_comments_fetched += len(video_comments)
@@ -1168,7 +1257,7 @@ if st.session_state["results"] is not None:
     # Save remaining data
     st.markdown("---")
     if st.button("💾  SAVE REMAINING DATA TO GOOGLE SHEETS", type="primary"):
-        with st.spinner("Saving to Google Sheets…"):
+        with st.spinner("Saving to database…"):
             # Videos
             vid_saved, vid_dup = append_unique_rows(
                 conn, VIDEOS_SHEET, res["videos_df"], key_col="video_id"
