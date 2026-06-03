@@ -1,8 +1,7 @@
 streamlit>=1.35.0
-streamlit-gsheets-connection>=0.0.8
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
 google-api-python-client>=2.130.0
 youtube-transcript-api>=0.6.2
 pandas>=2.0.0
 tenacity>=8.2.0
-pyktok>=0.2.0
-selenium>=4.15.0
