@@ -153,7 +153,6 @@ def ensure_database_ready(engine: Engine, schema: str) -> None:
     ddl = f'''
     CREATE SCHEMA IF NOT EXISTS "{schema}";
     CREATE EXTENSION IF NOT EXISTS pgcrypto;
-    CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
     CREATE TABLE IF NOT EXISTS "{schema}".projects (
         project_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -294,8 +293,6 @@ def ensure_database_ready(engine: Engine, schema: str) -> None:
         PRIMARY KEY (project_id, platform, comment_id)
     );
 
-    CREATE INDEX IF NOT EXISTS idx_videos_title_trgm ON "{schema}".videos USING GIN (title gin_trgm_ops);
-    CREATE INDEX IF NOT EXISTS idx_comments_text_trgm ON "{schema}".comments USING GIN (comment_text gin_trgm_ops);
     CREATE INDEX IF NOT EXISTS idx_project_videos_project ON "{schema}".project_videos(project_id);
     CREATE INDEX IF NOT EXISTS idx_project_comments_project ON "{schema}".project_comments(project_id);
     '''
