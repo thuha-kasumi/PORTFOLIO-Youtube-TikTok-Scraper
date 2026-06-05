@@ -417,6 +417,37 @@ def get_recently_scraped_video_ids(engine: Engine, schema: str, days: int = 7) -
         return set()
 
 
+def bulk_insert_rows(conn, schema: str, table_name: str, rows: List[Dict], conflict_cols: List[str], update_cols: List[str]) -> int:
+    """Fast PostgreSQL bulk upsert using SQLAlchemy executemany."""
+    if not rows:
+        return 0
+
+    columns = list(rows[0].keys())
+
+    col_sql = ", ".join(f'"{c}"' for c in columns)
+    val_sql = ", ".join(f":{c}" for c in columns)
+    conflict_sql = ", ".join(f'"{c}"' for c in conflict_cols)
+
+    if update_cols:
+        update_sql = ", ".join(
+            f'"{c}" = COALESCE(EXCLUDED."{c}", "{schema}"."{table_name}"."{c}")'
+            for c in update_cols
+            if c not in conflict_cols
+        )
+        conflict_action = f"DO UPDATE SET {update_sql}" if update_sql else "DO NOTHING"
+    else:
+        conflict_action = "DO NOTHING"
+
+    sql = text(f'''
+        INSERT INTO "{schema}"."{table_name}" ({col_sql})
+        VALUES ({val_sql})
+        ON CONFLICT ({conflict_sql}) {conflict_action}
+    ''')
+
+    conn.execute(sql, rows)
+    return len(rows)
+
+
 def save_results_to_database(engine: Engine, schema: str, project_id: str, run_id: str, res: Dict, params: Dict) -> Dict[str, int]:
     """Upsert scraped rows into normalized DB and map them to the project/run."""
     platform = params["platform"].lower()
@@ -556,54 +587,62 @@ def save_results_to_database(engine: Engine, schema: str, project_id: str, run_i
             )
             counts["transcripts"] += 1
 
+        comment_rows = []
+        project_comment_rows = []
+
         for _, r in comments_df.iterrows():
-            conn.execute(
-                text(f'''
-                    INSERT INTO {qualified(schema, "comments")}
-                    (platform, comment_id, video_id, author, author_channel_id, comment_text,
-                     comment_published_at, comment_likes, comment_reply_count, scraped_at, first_seen_run_id)
-                    VALUES
-                    (:platform, :comment_id, :video_id, :author, :author_channel_id, :comment_text,
-                     :comment_published_at, :comment_likes, :comment_reply_count, NOW(), :run_id)
-                    ON CONFLICT (platform, comment_id) DO UPDATE SET
-                        video_id = COALESCE(EXCLUDED.video_id, {qualified(schema, "comments")}.video_id),
-                        author = COALESCE(EXCLUDED.author, {qualified(schema, "comments")}.author),
-                        author_channel_id = COALESCE(EXCLUDED.author_channel_id, {qualified(schema, "comments")}.author_channel_id),
-                        comment_text = COALESCE(EXCLUDED.comment_text, {qualified(schema, "comments")}.comment_text),
-                        comment_published_at = COALESCE(EXCLUDED.comment_published_at, {qualified(schema, "comments")}.comment_published_at),
-                        comment_likes = COALESCE(EXCLUDED.comment_likes, {qualified(schema, "comments")}.comment_likes),
-                        comment_reply_count = COALESCE(EXCLUDED.comment_reply_count, {qualified(schema, "comments")}.comment_reply_count),
-                        scraped_at = NOW()
-                '''),
-                {
-                    "platform": platform,
-                    "comment_id": str(r.get("comment_id", "")),
-                    "video_id": str(r.get("video_id", "")),
-                    "author": r.get("author"),
-                    "author_channel_id": r.get("author_channel_id"),
-                    "comment_text": r.get("comment_text") or "",
-                    "comment_published_at": pd.to_datetime(r.get("comment_published_at"), errors="coerce").to_pydatetime() if pd.notna(pd.to_datetime(r.get("comment_published_at"), errors="coerce")) else None,
-                    "comment_likes": safe_int(r.get("comment_likes"), 0),
-                    "comment_reply_count": safe_int(r.get("comment_reply_count"), 0),
-                    "run_id": run_id,
-                },
-            )
-            conn.execute(
-                text(f'''
-                    INSERT INTO {qualified(schema, "project_comments")}
-                    (project_id, run_id, platform, comment_id, matched_comment_kw)
-                    VALUES (:project_id, :run_id, :platform, :comment_id, :matched_comment_kw)
-                    ON CONFLICT (project_id, platform, comment_id) DO UPDATE SET run_id = EXCLUDED.run_id
-                '''),
-                {
-                    "project_id": project_id,
-                    "run_id": run_id,
-                    "platform": platform,
-                    "comment_id": str(r.get("comment_id", "")),
-                    "matched_comment_kw": bool(params.get("comment_kw")),
-                },
-            )
-            counts["comments"] += 1
+            comment_id = str(r.get("comment_id", ""))
+            if not comment_id:
+                continue
+
+            parsed_date = pd.to_datetime(r.get("comment_published_at"), errors="coerce")
+            comment_rows.append({
+                "platform": platform,
+                "comment_id": comment_id,
+                "video_id": str(r.get("video_id", "")),
+                "author": r.get("author"),
+                "author_channel_id": r.get("author_channel_id"),
+                "comment_text": r.get("comment_text") or "",
+                "comment_published_at": parsed_date.to_pydatetime() if pd.notna(parsed_date) else None,
+                "comment_likes": safe_int(r.get("comment_likes"), 0),
+                "comment_reply_count": safe_int(r.get("comment_reply_count"), 0),
+                "first_seen_run_id": run_id,
+            })
+
+            project_comment_rows.append({
+                "project_id": project_id,
+                "run_id": run_id,
+                "platform": platform,
+                "comment_id": comment_id,
+                "matched_comment_kw": bool(params.get("comment_kw")),
+            })
+
+        counts["comments"] += bulk_insert_rows(
+            conn,
+            schema,
+            "comments",
+            comment_rows,
+            conflict_cols=["platform", "comment_id"],
+            update_cols=[
+                "video_id",
+                "author",
+                "author_channel_id",
+                "comment_text",
+                "comment_published_at",
+                "comment_likes",
+                "comment_reply_count",
+                "first_seen_run_id",
+            ],
+        )
+
+        bulk_insert_rows(
+            conn,
+            schema,
+            "project_comments",
+            project_comment_rows,
+            conflict_cols=["project_id", "platform", "comment_id"],
+            update_cols=["run_id", "matched_comment_kw"],
+        )
 
     return counts
 
@@ -790,13 +829,34 @@ def read_project_exports(engine: Engine, schema: str, project_name: str) -> Dict
     return {name: pd.read_sql_query(text(sql), engine, params=params) for name, sql in queries.items()}
 
 
+def clean_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            s = pd.to_datetime(df[col], errors="coerce")
+            if getattr(s.dt, "tz", None) is not None:
+                df[col] = s.dt.tz_localize(None)
+            else:
+                df[col] = s
+
+        elif df[col].dtype == "object":
+            df[col] = df[col].apply(
+                lambda x: x.replace(tzinfo=None)
+                if hasattr(x, "tzinfo") and x.tzinfo is not None
+                else x
+            )
+
+    return df
+
+
 def make_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for sheet_name, df in sheets.items():
-            # Excel sheet names max 31 chars.
             safe_sheet = sheet_name[:31]
-            df.to_excel(writer, sheet_name=safe_sheet, index=False)
+            clean_df = clean_for_excel(df)
+            clean_df.to_excel(writer, sheet_name=safe_sheet, index=False)
     return output.getvalue()
 
 
@@ -1430,21 +1490,21 @@ if st.session_state["results"] is not None:
 
     st.subheader("Preview: Videos")
     preview_cols = ["title", "channel_name", "platform", "published_at", "view_count", "like_count", "comment_count", "video_url"]
-    st.dataframe(res["videos_df"][[c for c in preview_cols if c in res["videos_df"].columns]].head(20), use_container_width=True)
+    st.dataframe(res["videos_df"][[c for c in preview_cols if c in res["videos_df"].columns]].head(20), width="stretch")
 
     if not res["channels_df"].empty:
         st.subheader("Preview: Channels / Creators")
         ch_cols = ["channel_name", "platform", "channel_url", "subscriber_count", "follower_count", "video_count", "total_views"]
-        st.dataframe(res["channels_df"][[c for c in ch_cols if c in res["channels_df"].columns]].head(20), use_container_width=True)
+        st.dataframe(res["channels_df"][[c for c in ch_cols if c in res["channels_df"].columns]].head(20), width="stretch")
 
     if not res["comments_preview_df"].empty:
         st.subheader(f"Preview: Comments (first 20 of {res['total_comments_collected']})")
         cm_cols = ["video_title", "author", "comment_text", "comment_published_at", "comment_likes", "comment_reply_count"]
-        st.dataframe(res["comments_preview_df"][[c for c in cm_cols if c in res["comments_preview_df"].columns]].head(20), use_container_width=True)
+        st.dataframe(res["comments_preview_df"][[c for c in cm_cols if c in res["comments_preview_df"].columns]].head(20), width="stretch")
 
     if not res["transcripts_df"].empty:
         st.subheader(f"Preview: Transcripts ({len(res['transcripts_df'])} videos)")
-        st.dataframe(res["transcripts_df"][["video_id", "full_transcript"]].head(5), use_container_width=True)
+        st.dataframe(res["transcripts_df"][["video_id", "full_transcript"]].head(5), width="stretch")
 
     st.markdown("---")
     if st.button("💾 Save to Database", type="primary"):
