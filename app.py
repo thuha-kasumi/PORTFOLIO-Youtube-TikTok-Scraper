@@ -21,11 +21,19 @@ from datetime import date, datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
+import requests
 import streamlit as st
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
+
+try:
+    from psycopg2.extras import execute_values
+    PSYCOPG2_EXECUTE_VALUES_AVAILABLE = True
+except Exception:
+    execute_values = None
+    PSYCOPG2_EXECUTE_VALUES_AVAILABLE = False
 from tenacity import retry, stop_after_attempt, wait_exponential
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
@@ -36,9 +44,19 @@ try:
 except ImportError:
     PYKTOK_AVAILABLE = False
 
+try:
+    import praw
+    PRAW_AVAILABLE = True
+except ImportError:
+    PRAW_AVAILABLE = False
+
 
 PLATFORM_YOUTUBE = "YouTube"
 PLATFORM_TIKTOK = "TikTok"
+PLATFORM_REDDIT = "Reddit"
+PLATFORM_FACEBOOK = "Facebook"
+PLATFORM_INSTAGRAM = "Instagram"
+PLATFORMS = [PLATFORM_YOUTUBE, PLATFORM_TIKTOK, PLATFORM_REDDIT, PLATFORM_FACEBOOK, PLATFORM_INSTAGRAM]
 DB_SCHEMA_DEFAULT = "social_scraper"
 
 QUOTA_COSTS = {
@@ -417,20 +435,46 @@ def get_recently_scraped_video_ids(engine: Engine, schema: str, days: int = 7) -
         return set()
 
 
-def bulk_insert_rows(conn, schema: str, table_name: str, rows: List[Dict], conflict_cols: List[str], update_cols: List[str]) -> int:
-    """Fast PostgreSQL bulk upsert using SQLAlchemy executemany."""
+def _get_driver_connection(sa_conn):
+    """Return the DBAPI connection behind a SQLAlchemy connection."""
+    inner = sa_conn.connection
+    return getattr(inner, "driver_connection", getattr(inner, "connection", inner))
+
+
+def _quote_ident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def bulk_insert_rows(
+    conn,
+    schema: str,
+    table_name: str,
+    rows: List[Dict],
+    conflict_cols: List[str],
+    update_cols: Optional[List[str]] = None,
+    page_size: int = 10000,
+) -> int:
+    """Fast PostgreSQL bulk insert/upsert.
+
+    Uses psycopg2.extras.execute_values when available. This is much faster than
+    SQLAlchemy row-by-row INSERTs for 50K+ comment batches on Neon. If
+    update_cols is empty or None, conflicts use DO NOTHING, which is the fastest
+    and is usually ideal for immutable raw comments.
+    """
     if not rows:
         return 0
 
+    update_cols = update_cols or []
     columns = list(rows[0].keys())
+    values = [tuple(row.get(c) for c in columns) for row in rows]
 
-    col_sql = ", ".join(f'"{c}"' for c in columns)
-    val_sql = ", ".join(f":{c}" for c in columns)
-    conflict_sql = ", ".join(f'"{c}"' for c in conflict_cols)
+    table_sql = f'{_quote_ident(schema)}.{_quote_ident(table_name)}'
+    col_sql = ", ".join(_quote_ident(c) for c in columns)
+    conflict_sql = ", ".join(_quote_ident(c) for c in conflict_cols)
 
     if update_cols:
         update_sql = ", ".join(
-            f'"{c}" = COALESCE(EXCLUDED."{c}", "{schema}"."{table_name}"."{c}")'
+            f'{_quote_ident(c)} = COALESCE(EXCLUDED.{_quote_ident(c)}, t.{_quote_ident(c)})'
             for c in update_cols
             if c not in conflict_cols
         )
@@ -438,15 +482,26 @@ def bulk_insert_rows(conn, schema: str, table_name: str, rows: List[Dict], confl
     else:
         conflict_action = "DO NOTHING"
 
-    sql = text(f'''
+    sql = f"""
+        INSERT INTO {table_sql} AS t ({col_sql})
+        VALUES %s
+        ON CONFLICT ({conflict_sql}) {conflict_action}
+    """
+
+    if conn.engine.dialect.name == "postgresql" and PSYCOPG2_EXECUTE_VALUES_AVAILABLE:
+        raw = _get_driver_connection(conn)
+        with raw.cursor() as cur:
+            execute_values(cur, sql, values, page_size=page_size)
+        return len(rows)
+
+    val_sql = ", ".join(f":{c}" for c in columns)
+    fallback_sql = text(f"""
         INSERT INTO "{schema}"."{table_name}" ({col_sql})
         VALUES ({val_sql})
         ON CONFLICT ({conflict_sql}) {conflict_action}
-    ''')
-
-    conn.execute(sql, rows)
+    """)
+    conn.execute(fallback_sql, rows)
     return len(rows)
-
 
 def save_results_to_database(engine: Engine, schema: str, project_id: str, run_id: str, res: Dict, params: Dict) -> Dict[str, int]:
     """Upsert scraped rows into normalized DB and map them to the project/run."""
@@ -623,16 +678,9 @@ def save_results_to_database(engine: Engine, schema: str, project_id: str, run_i
             "comments",
             comment_rows,
             conflict_cols=["platform", "comment_id"],
-            update_cols=[
-                "video_id",
-                "author",
-                "author_channel_id",
-                "comment_text",
-                "comment_published_at",
-                "comment_likes",
-                "comment_reply_count",
-                "first_seen_run_id",
-            ],
+            # Raw comments are treated as immutable. DO NOTHING on duplicate is much faster
+            # than rewriting existing 250K+ rows.
+            update_cols=[],
         )
 
         bulk_insert_rows(
@@ -641,7 +689,8 @@ def save_results_to_database(engine: Engine, schema: str, project_id: str, run_i
             "project_comments",
             project_comment_rows,
             conflict_cols=["project_id", "platform", "comment_id"],
-            update_cols=["run_id", "matched_comment_kw"],
+            # Keep the first project mapping and avoid rewriting duplicate mappings.
+            update_cols=[],
         )
 
     return counts
@@ -1139,6 +1188,227 @@ class TikTokScraper:
         return {"channel_id": channel_id, "channel_name": channel_id, "channel_url": f"https://www.tiktok.com/@{channel_id}", "platform": "tiktok"}
 
 
+
+# =============================================================================
+# Reddit, Facebook, and Instagram helpers
+# =============================================================================
+
+def get_reddit_client():
+    """Create a read-only Reddit client using PRAW."""
+    if not PRAW_AVAILABLE:
+        st.error("Reddit scraping requires praw. Add praw>=7.8.0 to requirements.txt.")
+        st.stop()
+    client_id = st.secrets.get("REDDIT_CLIENT_ID", "")
+    client_secret = st.secrets.get("REDDIT_CLIENT_SECRET", "")
+    user_agent = st.secrets.get("REDDIT_USER_AGENT", "social-content-scraper/1.0")
+    if not client_id or not client_secret:
+        st.error("Missing Reddit credentials. Add REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, and REDDIT_USER_AGENT to Streamlit secrets.")
+        st.stop()
+    return praw.Reddit(client_id=client_id, client_secret=client_secret, user_agent=user_agent)
+
+
+def scrape_reddit(seed_query: str, source_targets: str, target_comments: int, scan_pool_size: int, comments_per_post_limit: int, existing_ids: set, comment_kw: str = "") -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
+    """Scrape Reddit submissions and comments into the common videos/comments/channels shape."""
+    reddit = get_reddit_client()
+    subreddits = [s.strip().replace("r/", "") for s in str(source_targets or "").split(",") if s.strip()]
+    if not subreddits:
+        subreddits = ["all"]
+
+    submissions = []
+    per_sub_limit = max(1, int(scan_pool_size / max(len(subreddits), 1)))
+    for sub in subreddits:
+        try:
+            submissions.extend(list(reddit.subreddit(sub).search(seed_query or "discussion", sort="relevance", time_filter="all", limit=per_sub_limit)))
+        except Exception as exc:
+            st.warning(f"Reddit search skipped r/{sub}: {exc}")
+
+    videos, comments, channels = [], [], []
+    seen_posts, seen_channels = set(), set()
+    for submission in submissions:
+        if len(comments) >= int(target_comments):
+            break
+        sid = str(submission.id)
+        if sid in seen_posts:
+            continue
+        seen_posts.add(sid)
+        subreddit_name = str(getattr(submission.subreddit, "display_name", ""))
+        channel_id = f"r/{subreddit_name}" if subreddit_name else "reddit"
+        if channel_id not in seen_channels:
+            seen_channels.add(channel_id)
+            channels.append({
+                "channel_id": channel_id,
+                "channel_name": channel_id,
+                "channel_url": f"https://www.reddit.com/r/{subreddit_name}/" if subreddit_name else "https://www.reddit.com/",
+                "platform": "reddit",
+                "subscriber_count": safe_int(getattr(submission.subreddit, "subscribers", 0), None),
+            })
+
+        videos.append({
+            "video_id": sid,
+            "title": getattr(submission, "title", ""),
+            "channel_name": channel_id,
+            "channel_id": channel_id,
+            "published_at": datetime.utcfromtimestamp(float(getattr(submission, "created_utc", 0))).strftime("%Y-%m-%d") if getattr(submission, "created_utc", None) else "",
+            "view_count": "0",
+            "like_count": str(safe_int(getattr(submission, "score", 0), 0)),
+            "comment_count": str(safe_int(getattr(submission, "num_comments", 0), 0)),
+            "description": getattr(submission, "selftext", ""),
+            "video_url": f"https://www.reddit.com{getattr(submission, 'permalink', '')}",
+            "platform": "reddit",
+            "_transcript": "",
+        })
+
+        try:
+            submission.comments.replace_more(limit=16)
+            flattened = submission.comments.list()
+        except Exception as exc:
+            st.warning(f"Could not expand Reddit comments for {sid}: {exc}")
+            flattened = []
+
+        fetched_for_post = 0
+        for c in flattened:
+            if len(comments) >= int(target_comments) or fetched_for_post >= int(comments_per_post_limit):
+                break
+            cid = f"reddit_{getattr(c, 'id', '')}"
+            if cid in existing_ids:
+                continue
+            body = getattr(c, "body", "") or ""
+            if comment_kw.strip() and not all_keywords_present(body, comment_kw):
+                continue
+            comments.append({
+                "comment_id": cid,
+                "comment_text": body,
+                "author": str(getattr(c, "author", "")) if getattr(c, "author", None) else "[deleted]",
+                "author_channel_id": str(getattr(c, "author", "")) if getattr(c, "author", None) else "",
+                "comment_published_at": datetime.utcfromtimestamp(float(getattr(c, "created_utc", 0))).strftime("%Y-%m-%d") if getattr(c, "created_utc", None) else "",
+                "comment_likes": safe_int(getattr(c, "score", 0), 0),
+                "comment_reply_count": len(getattr(c, "replies", []) or []),
+                "video_id": sid,
+                "video_title": getattr(submission, "title", ""),
+                "video_url": f"https://www.reddit.com{getattr(submission, 'permalink', '')}",
+            })
+            fetched_for_post += 1
+    return videos, comments, channels, []
+
+
+def get_meta_access_token() -> str:
+    token = st.secrets.get("META_ACCESS_TOKEN", "") or st.secrets.get("FACEBOOK_ACCESS_TOKEN", "")
+    if not token:
+        st.error("Missing Meta token. Add META_ACCESS_TOKEN to Streamlit secrets for Facebook/Instagram Graph API access.")
+        st.stop()
+    return token
+
+
+def graph_get(path: str, params: Optional[Dict] = None, limit_pages: int = 25) -> List[Dict]:
+    token = get_meta_access_token()
+    url = f"https://graph.facebook.com/v21.0/{path.lstrip('/')}"
+    params = dict(params or {})
+    params["access_token"] = token
+    out = []
+    pages = 0
+    while url and pages < limit_pages:
+        resp = requests.get(url, params=params if pages == 0 else None, timeout=45)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Meta Graph API error {resp.status_code}: {resp.text[:500]}")
+        payload = resp.json()
+        data = payload.get("data", [])
+        if isinstance(data, list):
+            out.extend(data)
+        elif isinstance(data, dict):
+            out.append(data)
+        url = payload.get("paging", {}).get("next")
+        params = None
+        pages += 1
+    return out
+
+
+def scrape_facebook(seed_query: str, source_targets: str, target_comments: int, scan_pool_size: int, comments_per_post_limit: int, existing_ids: set, comment_kw: str = "") -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
+    targets = [t.strip() for t in str(source_targets or "").split(",") if t.strip()]
+    if not targets:
+        st.error("Facebook requires Page or accessible Group IDs/usernames in the Source targets box.")
+        st.stop()
+    videos, comments, channels = [], [], []
+    fields = "id,message,created_time,permalink_url,shares,comments.limit(0).summary(true),reactions.limit(0).summary(true)"
+    for target in targets:
+        if len(comments) >= int(target_comments):
+            break
+        channels.append({"channel_id": target, "channel_name": target, "channel_url": f"https://www.facebook.com/{target}", "platform": "facebook"})
+        try:
+            posts = graph_get(f"/{target}/posts", {"fields": fields, "limit": min(100, int(scan_pool_size))}, limit_pages=max(1, int(scan_pool_size)//100 + 1))
+        except Exception as exc:
+            st.warning(f"Facebook target skipped ({target}): {exc}")
+            continue
+        for post in posts[:int(scan_pool_size)]:
+            if len(comments) >= int(target_comments):
+                break
+            text_blob = post.get("message", "") or ""
+            pid = post.get("id", "")
+            stats_comments = (((post.get("comments") or {}).get("summary") or {}).get("total_count"))
+            stats_reactions = (((post.get("reactions") or {}).get("summary") or {}).get("total_count"))
+            videos.append({"video_id": pid, "title": text_blob[:250] or pid, "channel_id": target, "channel_name": target, "published_at": (post.get("created_time") or "")[:10], "view_count": "0", "like_count": str(safe_int(stats_reactions, 0)), "comment_count": str(safe_int(stats_comments, 0)), "description": text_blob, "video_url": post.get("permalink_url", ""), "platform": "facebook", "_transcript": ""})
+            try:
+                fb_comments = graph_get(f"/{pid}/comments", {"fields": "id,message,from,created_time,like_count,comment_count,parent", "limit": 100, "filter": "stream"}, limit_pages=max(1, int(comments_per_post_limit)//100 + 1))
+            except Exception as exc:
+                st.warning(f"Could not fetch Facebook comments for {pid}: {exc}")
+                fb_comments = []
+            fetched_for_post = 0
+            for c in fb_comments:
+                if len(comments) >= int(target_comments) or fetched_for_post >= int(comments_per_post_limit):
+                    break
+                cid = f"facebook_{c.get('id', '')}"
+                body = c.get("message", "") or ""
+                if not cid or cid in existing_ids:
+                    continue
+                if comment_kw.strip() and not all_keywords_present(body, comment_kw):
+                    continue
+                author = c.get("from") or {}
+                comments.append({"comment_id": cid, "comment_text": body, "author": author.get("name", ""), "author_channel_id": author.get("id", ""), "comment_published_at": (c.get("created_time") or "")[:10], "comment_likes": safe_int(c.get("like_count", 0), 0), "comment_reply_count": safe_int(c.get("comment_count", 0), 0), "video_id": pid, "video_title": text_blob[:250] or pid, "video_url": post.get("permalink_url", "")})
+                fetched_for_post += 1
+    return videos, comments, channels, []
+
+
+def scrape_instagram(seed_query: str, source_targets: str, target_comments: int, scan_pool_size: int, comments_per_media_limit: int, existing_ids: set, comment_kw: str = "") -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
+    targets = [t.strip() for t in str(source_targets or "").split(",") if t.strip()]
+    if not targets:
+        st.error("Instagram requires Instagram Business/Creator account IDs in the Source targets box.")
+        st.stop()
+    videos, comments, channels = [], [], []
+    media_fields = "id,caption,comments_count,like_count,media_type,media_url,permalink,timestamp,username"
+    for ig_user_id in targets:
+        if len(comments) >= int(target_comments):
+            break
+        channels.append({"channel_id": ig_user_id, "channel_name": ig_user_id, "channel_url": f"https://www.instagram.com/{ig_user_id}/", "platform": "instagram"})
+        try:
+            media_items = graph_get(f"/{ig_user_id}/media", {"fields": media_fields, "limit": min(100, int(scan_pool_size))}, limit_pages=max(1, int(scan_pool_size)//100 + 1))
+        except Exception as exc:
+            st.warning(f"Instagram target skipped ({ig_user_id}): {exc}")
+            continue
+        for media in media_items[:int(scan_pool_size)]:
+            if len(comments) >= int(target_comments):
+                break
+            caption = media.get("caption", "") or ""
+            mid = media.get("id", "")
+            videos.append({"video_id": mid, "title": caption[:250] or mid, "channel_id": ig_user_id, "channel_name": media.get("username", ig_user_id), "published_at": (media.get("timestamp") or "")[:10], "view_count": "0", "like_count": str(safe_int(media.get("like_count", 0), 0)), "comment_count": str(safe_int(media.get("comments_count", 0), 0)), "description": caption, "video_url": media.get("permalink", ""), "platform": "instagram", "_transcript": ""})
+            try:
+                ig_comments = graph_get(f"/{mid}/comments", {"fields": "id,text,username,timestamp,like_count,replies{id,text,username,timestamp,like_count}", "limit": 100}, limit_pages=max(1, int(comments_per_media_limit)//100 + 1))
+            except Exception as exc:
+                st.warning(f"Could not fetch Instagram comments for {mid}: {exc}")
+                ig_comments = []
+            fetched_for_media = 0
+            for c in ig_comments:
+                if len(comments) >= int(target_comments) or fetched_for_media >= int(comments_per_media_limit):
+                    break
+                cid = f"instagram_{c.get('id', '')}"
+                body = c.get("text", "") or ""
+                if not cid or cid in existing_ids:
+                    continue
+                if comment_kw.strip() and not all_keywords_present(body, comment_kw):
+                    continue
+                replies = (c.get("replies") or {}).get("data", []) if isinstance(c.get("replies"), dict) else []
+                comments.append({"comment_id": cid, "comment_text": body, "author": c.get("username", ""), "author_channel_id": c.get("username", ""), "comment_published_at": (c.get("timestamp") or "")[:10], "comment_likes": safe_int(c.get("like_count", 0), 0), "comment_reply_count": len(replies), "video_id": mid, "video_title": caption[:250] or mid, "video_url": media.get("permalink", "")})
+                fetched_for_media += 1
+    return videos, comments, channels, []
+
 # =============================================================================
 # Filtering helpers
 # =============================================================================
@@ -1198,17 +1468,26 @@ with st.sidebar:
     st.markdown(
         f'<div class="quota-warning">📊 <strong>YouTube API Quota Remaining</strong><br>'
         f'<span style="color:{quota_color}; font-size:24px; font-weight:bold;">{quota_remaining}</span> / 10,000 units<br>'
-        f'<span style="font-size:12px;">TikTok requires local/browser setup</span></div>',
+        f'<span style="font-size:12px;">TikTok local/browser; Reddit/Meta require API credentials</span></div>',
         unsafe_allow_html=True,
     )
 
 with st.sidebar:
     st.header("🔍 Platform & Project")
-    platform = st.radio("Select Platform", [PLATFORM_YOUTUBE, PLATFORM_TIKTOK], horizontal=True)
+    platform = st.radio("Select Platform", PLATFORMS, horizontal=True)
     user_name = st.text_input("Your name *", placeholder="e.g. Thu Ha")
     st.markdown('<div class="small-grey">Required; recorded in run log.</div>', unsafe_allow_html=True)
     project_name = st.text_input("Project name *", placeholder="e.g. Vietnam Street Food")
     st.markdown('<div class="small-grey">Case/spacing-insensitive grouping, e.g. Vietnam Street Food = vietnam streetfood.</div>', unsafe_allow_html=True)
+    source_targets = ""
+    if platform == PLATFORM_REDDIT:
+        source_targets = st.text_input("Source targets", placeholder="Optional: subreddits, e.g. vietnam, food, AskReddit. Blank = all Reddit")
+    elif platform == PLATFORM_FACEBOOK:
+        source_targets = st.text_input("Source targets *", placeholder="Facebook Page IDs/usernames, comma-separated")
+        st.caption("Facebook Groups require permissions and may not be available through the standard Graph API.")
+    elif platform == PLATFORM_INSTAGRAM:
+        source_targets = st.text_input("Source targets *", placeholder="Instagram Business/Creator account IDs, comma-separated")
+        st.caption("Instagram API works for Business/Creator accounts your Meta token can access, not arbitrary public scraping.")
 
     st.markdown("---")
     st.subheader("🔎 Keyword Filters")
@@ -1219,7 +1498,7 @@ with st.sidebar:
         transcript_kw = st.text_input("Transcript contains (YouTube only)", placeholder="e.g. spicy, Hanoi")
     else:
         transcript_kw = ""
-        st.info("TikTok transcripts are not available. Use Title/Description or Comments filters.")
+        st.info("Transcripts are currently available only for YouTube. Use Title/Description or Comments filters for this platform.")
     comment_kw = st.text_input("Comments contain", placeholder="e.g. delicious, cheap")
 
     st.markdown("---")
@@ -1239,7 +1518,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("⚙️ Collection Settings")
-    target_comments = st.number_input("🎯 Target number of comments to collect", min_value=0, max_value=50000, value=20000, step=500)
+    target_comments = st.number_input("🎯 Target number of comments to collect", min_value=0, max_value=300000, value=20000, step=500)
     scan_pool_size = st.number_input("🔍 Search pool size (max videos to scan)", min_value=50, max_value=1000, value=1000, step=50)
     enable_max_comments_per_video = st.checkbox("Limit comments per video", value=True)
     if enable_max_comments_per_video:
@@ -1251,7 +1530,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("💾 Optional Saves")
-    save_transcripts = st.checkbox("Save full transcripts (YouTube only)", value=True)
+    save_transcripts = st.checkbox("Save full transcripts (YouTube only; can slow exports)", value=False)
 
 
 run_search = st.button("▶ Run Scrape", type="primary")
@@ -1268,6 +1547,9 @@ if run_search:
     if not any([title_kw.strip(), channel_kw.strip(), transcript_kw.strip(), comment_kw.strip()]):
         st.error("Please enter at least one keyword filter: Title/Description, Channel/Author, Transcript, or Comments.")
         st.stop()
+    if platform in [PLATFORM_FACEBOOK, PLATFORM_INSTAGRAM] and not source_targets.strip():
+        st.error("This platform requires Source targets because the official API cannot search all public content globally.")
+        st.stop()
 
     params = {
         "user_name": user_name.strip(),
@@ -1277,6 +1559,7 @@ if run_search:
         "channel_kw": channel_kw.strip(),
         "transcript_kw": transcript_kw.strip(),
         "comment_kw": comment_kw.strip(),
+        "source_targets": source_targets.strip(),
         "publish_date_start": publish_date_start,
         "publish_date_end": publish_date_end,
         "min_views": min_views,
@@ -1376,7 +1659,7 @@ if run_search:
                     if info:
                         channel_info_list.append(info)
 
-        else:
+        elif platform == PLATFORM_TIKTOK:
             if not PYKTOK_AVAILABLE:
                 st.error("TikTok scraping requires pyktok + Selenium + Firefox/geckodriver. It is best run locally or on a backend worker, not Streamlit Cloud.")
                 st.stop()
@@ -1410,6 +1693,45 @@ if run_search:
                     existing_comment_ids.add(c["comment_id"])
             unique_channel_ids = list({v.get("channel_id") for v in videos_processed if v.get("channel_id")})
             channel_info_list = [tiktok.fetch_channel_info(cid) for cid in unique_channel_ids]
+
+        elif platform == PLATFORM_REDDIT:
+            seed_query = build_seed_query(title_kw, channel_kw, "", comment_kw)
+            with st.spinner(f"Searching Reddit for {seed_query!r}..."):
+                videos_processed, all_comments, channel_info_list, _ = scrape_reddit(
+                    seed_query=seed_query,
+                    source_targets=params.get("source_targets", ""),
+                    target_comments=int(target_comments),
+                    scan_pool_size=int(scan_pool_size),
+                    comments_per_post_limit=int(comments_per_video_limit),
+                    existing_ids=existing_comment_ids,
+                    comment_kw=comment_kw,
+                )
+
+        elif platform == PLATFORM_FACEBOOK:
+            seed_query = build_seed_query(title_kw, channel_kw, "", comment_kw)
+            with st.spinner("Fetching Facebook posts and comments via Meta Graph API..."):
+                videos_processed, all_comments, channel_info_list, _ = scrape_facebook(
+                    seed_query=seed_query,
+                    source_targets=params.get("source_targets", ""),
+                    target_comments=int(target_comments),
+                    scan_pool_size=int(scan_pool_size),
+                    comments_per_post_limit=int(comments_per_video_limit),
+                    existing_ids=existing_comment_ids,
+                    comment_kw=comment_kw,
+                )
+
+        elif platform == PLATFORM_INSTAGRAM:
+            seed_query = build_seed_query(title_kw, channel_kw, "", comment_kw)
+            with st.spinner("Fetching Instagram media and comments via Meta Graph API..."):
+                videos_processed, all_comments, channel_info_list, _ = scrape_instagram(
+                    seed_query=seed_query,
+                    source_targets=params.get("source_targets", ""),
+                    target_comments=int(target_comments),
+                    scan_pool_size=int(scan_pool_size),
+                    comments_per_media_limit=int(comments_per_video_limit),
+                    existing_ids=existing_comment_ids,
+                    comment_kw=comment_kw,
+                )
 
     except Exception as exc:
         st.exception(exc)
@@ -1513,7 +1835,8 @@ if st.session_state["results"] is not None:
         try:
             project_id, canonical_name = get_or_create_project(conn, schema, params["project_name"], params["user_name"])
             run_id = create_scrape_run(conn, schema, project_id, params)
-            counts = save_results_to_database(conn, schema, project_id, run_id, res, params)
+            with st.spinner(f"Saving {len(res['comments_df']):,} comments to Neon with fast bulk insert..."):
+                counts = save_results_to_database(conn, schema, project_id, run_id, res, params)
             complete_scrape_run(
                 conn, schema, run_id, "completed",
                 videos_found=len(res["videos_df"]),
