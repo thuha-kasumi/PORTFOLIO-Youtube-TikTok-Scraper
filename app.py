@@ -71,6 +71,21 @@ QUOTA_COSTS = {
 # Text and keyword matching helpers
 # =============================================================================
 
+def clean_db_value(value):
+    """Remove characters PostgreSQL cannot store safely."""
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+
+    return value
+
+
+def clean_db_row(row: dict) -> dict:
+    return {k: clean_db_value(v) for k, v in row.items()}
+
+
 def strip_accents(text_value: str) -> str:
     """Remove accents/diacritics while keeping base characters."""
     decomposed = unicodedata.normalize("NFKD", str(text_value or ""))
@@ -463,6 +478,8 @@ def bulk_insert_rows(
     """
     if not rows:
         return 0
+    
+    rows = [clean_db_row(row) for row in rows]
 
     update_cols = update_cols or []
     columns = list(rows[0].keys())
